@@ -104,7 +104,7 @@ button { cursor: pointer; }
 .goals-empty { border: 1px dashed #a9cfc1; border-radius: 12px; background: #fff; }
 .goals-empty p { color: #687d75; font-size: 15px; }
 .goals-illustration { width: 160px; height: 120px; }
-.goal-detail-modal { width: min(100%, 900px); height: min(86vh, 900px); max-height: calc(100dvh - 36px); padding: 34px; overflow-y: auto; border: 1px solid #d7e8e1; border-radius: 14px; box-shadow: 0 24px 70px #183f3424; }
+.goal-detail-modal { width: min(90vw, 1400px); min-width: min(60vw, 900px); height: min(90vh, 1100px); max-height: calc(100dvh - 24px); padding: 34px; overflow-y: auto; border: 1px solid #d7e8e1; border-radius: 14px; box-shadow: 0 24px 70px #183f3424; }
 .goal-detail-modal > .goal-topic-form { position: sticky; bottom: -34px; margin-top: auto; padding: 18px 0 0; background: #fff; box-shadow: 0 -8px 12px -12px #183f3430; }
 .goal-detail-modal .goal-topic-list { gap: 11px; }
 .goal-detail-modal .goal-topic-row { border: 1px solid #dceae4; border-radius: 10px; background: #fbfdfc; }
