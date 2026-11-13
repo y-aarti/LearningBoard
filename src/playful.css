@@ -290,9 +290,6 @@ button { cursor: pointer; }
 .goal-topic-bulk form { display: grid; gap: 12px; padding: 14px; }
 .goal-topic-bulk .form-label textarea { min-height: 108px; resize: vertical; }
 .goal-topic-bulk .secondary-button { justify-self: start; min-height: 40px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; }
-.goal-priority-control { display: flex; align-items: center; gap: 10px; margin: 14px 0; color: #526e65; font-size: 13px; font-weight: 700; }
-.goal-priority-control select { min-height: 38px; min-width: 130px; padding: 0 12px; border: 1px solid #cfe2d9; border-radius: 7px; background: #fff; color: #315b53; font: inherit; }
-.goal-priority-badge { display: inline-flex; width: max-content; align-items: center; padding: 4px 9px; border-radius: 20px; background: #fff1df; color: #a65d16; font-size: 11px; font-weight: 800; }
 
 @media (max-width: 960px) {
   .auth-page { grid-template-columns: minmax(410px, .95fr) minmax(390px, 1.05fr); }
