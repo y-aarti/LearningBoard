@@ -247,10 +247,12 @@ function App() {
     if (!user || !db) return;
     setDataError('');
     const nextById = new Map(next.map(task => [String(task.id), task]));
+    const removedTaskIds = new Set(tasks.filter(task => !nextById.has(String(task.id))).map(task => String(task.id)));
     const syncedGoals = personalGoals.map(goal => {
       let changed = false;
       const topics = (goal.topics || []).map(topic => {
         const topicTasks = (topic.tasks || []).map(topicTask => {
+          if (topicTask.boardTaskId && removedTaskIds.has(String(topicTask.boardTaskId))) { changed = true; return null; }
           if (!topicTask.boardTaskId) return topicTask;
           const boardTask = nextById.get(String(topicTask.boardTaskId));
           const done = boardTask ? boardTask.status === 'done' : false;
@@ -261,7 +263,8 @@ function App() {
           changed = true;
           return { ...topicTask, name, done, completedAt, addedToBoard, ...(boardTask ? {} : { boardTaskId: null }) };
         });
-        return topicTasks.some((item, index) => item !== (topic.tasks || [])[index]) ? { ...topic, tasks: topicTasks } : topic;
+        if (topicTasks.some((item, index) => item !== (topic.tasks || [])[index])) changed = true;
+        return topicTasks.some(item => item === null) ? { ...topic, tasks: topicTasks.filter(Boolean) } : topicTasks.some((item, index) => item !== (topic.tasks || [])[index]) ? { ...topic, tasks: topicTasks } : topic;
       });
       return changed ? { ...goal, topics, updatedAt: new Date().toISOString() } : goal;
     });
@@ -436,13 +439,15 @@ function App() {
   const deleteTopicTask = async (topicId, taskId) => {
     const topic = (activeGoal.topics || []).find(item => item.id === topicId);
     const task = (topic?.tasks || []).find(item => item.id === taskId);
-    if (!topic || !task || task.boardTaskId || !user || !db || saving) return;
+    if (!topic || !task || !user || !db || saving) return;
     const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(item => item.id === topicId ? { ...item, tasks: item.tasks.filter(topicTask => topicTask.id !== taskId) } : item) };
     pendingWrites.current += 1; setSaving(true); setDataError('');
     try {
       const batch = writeBatch(db);
       batch.set(doc(db, 'users', user.uid, 'goals', updatedGoal.id), updatedGoal, { merge: true });
+      if (task.boardTaskId) batch.delete(doc(db, 'users', user.uid, 'tasks', String(task.boardTaskId)));
       await batch.commit();
+      if (task.boardTaskId) setTasks(current => current.filter(boardTask => String(boardTask.id) !== String(task.boardTaskId)));
       setPersonalGoals(current => current.map(goal => goal.id === updatedGoal.id ? updatedGoal : goal));
       setActiveGoal(updatedGoal);
     } catch (error) { setDataError(error.message || 'Could not delete this task.'); }
@@ -599,7 +604,7 @@ function App() {
             <header><div><span className={`learning-mode mode-${(task.kind || 'Practice').toLowerCase()}`}>{task.kind || 'Practice'}</span><h4>{task.name}</h4><small>{task.topicName} · {difficulty}</small></div>{task.done && <span className="topic-task-board-status is-done">Done ✓</span>}</header>
             {task.description && <p className="skill-task-notes">{task.description}</p>}{notes && <p className="skill-task-notes">{notes}</p>}{cleanResourceLinks(links).map(link => <a className="topic-resource-link" key={link} href={link} target="_blank" rel="noreferrer">{link}</a>)}
             <details className="skill-task-details"><summary>Edit details · {revisionDate ? `revision ${revisionDate}` : 'no revision date'}</summary><div className="skill-task-details-grid"><label>Topic<select value={task.topicId} disabled={Boolean(task.boardTaskId)} onChange={event => moveTopicTask(task, event.target.value)}><option value={task.topicId}>{task.topicName}</option>{(activeGoal.topics || []).filter(item => item.id !== task.topicId).map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Learning mode<select value={task.kind || 'Practice'} onChange={event => updateTopicTaskField(task.topicId, task.id, 'kind', event.target.value)}><option>Learn</option><option>Practice</option><option>Build</option><option>Revise</option></select></label><label>Difficulty<select value={difficulty} onChange={event => updateTopicTaskField(task.topicId, task.id, 'difficulty', event.target.value)}><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></label><label>Revision reminder<input type="date" min={localDateKey()} value={revisionDate} onChange={event => updateTopicTaskField(task.topicId, task.id, 'revisionDate', event.target.value)}/></label><label>Plan for<input type="date" min={localDateKey()} value={task.plannedDate || localDateKey()} onChange={event => updateTopicTaskField(task.topicId, task.id, 'plannedDate', event.target.value)}/></label><label className="skill-task-wide">Description<textarea defaultValue={task.description || ''} rows="2" onBlur={event => { if (event.target.value !== (task.description || '')) updateTopicTaskField(task.topicId, task.id, 'description', event.target.value); }}/></label><label className="skill-task-wide">Notes<textarea defaultValue={notes} rows="2" onBlur={event => { if (event.target.value !== notes) updateTopicTaskField(task.topicId, task.id, 'notes', event.target.value); }}/></label><label className="skill-task-wide">Practice links<textarea defaultValue={cleanResourceLinks(links).join('\n')} rows="2" onBlur={event => { const next = cleanResourceLinks(event.target.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)); if (JSON.stringify(next) !== JSON.stringify(links)) updateTopicTaskField(task.topicId, task.id, 'links', next); }}/></label>{revisionDate && revisionDate <= localDateKey() && (!task.lastReviewed || task.lastReviewed < revisionDate) && <button type="button" className="revision-reminder" onClick={() => { const next = new Date(); next.setDate(next.getDate() + 7); updateTopicTaskFields(task.topicId, task.id, { lastReviewed: localDateKey(), revisionDate: localDateKey(next) }); }}>Revision due · mark reviewed</button>}</div></details>
-            <form className="study-time-form" onSubmit={event => { event.preventDefault(); logStudyTime(task.topicId, task.id); }}><span><Clock3 size={14}/> {minutes} min logged</span><input aria-label={`Minutes studied on ${task.name}`} type="number" min="1" max="1440" value={studyMinutes} onChange={event => setStudyMinutes(event.target.value)}/><button type="submit" disabled={saving}>Log time</button>{task.boardTaskId ? <span className={`topic-task-board-status ${task.done ? 'is-done' : ''}`}>{task.done ? 'Done ✓' : 'On board'}</span> : <button type="button" className="topic-task-add-board" disabled={saving} onClick={() => addTopicTaskToBoard(task.topicId, task.id)}><Plus size={13}/> Add to To do</button>}<button type="button" className="topic-task-delete" aria-label={`Delete ${task.name}`} title={task.boardTaskId ? 'Remove from the board before deleting' : 'Delete task'} disabled={saving || Boolean(task.boardTaskId)} onClick={() => deleteTopicTask(task.topicId, task.id)}><Trash2 size={14}/></button></form>
+            <form className="study-time-form" onSubmit={event => { event.preventDefault(); logStudyTime(task.topicId, task.id); }}><span><Clock3 size={14}/> {minutes} min logged</span><input aria-label={`Minutes studied on ${task.name}`} type="number" min="1" max="1440" value={studyMinutes} onChange={event => setStudyMinutes(event.target.value)}/><button type="submit" disabled={saving}>Log time</button>{task.boardTaskId ? <span className={`topic-task-board-status ${task.done ? 'is-done' : ''}`}>{task.done ? 'Done ✓' : 'On board'}</span> : <button type="button" className="topic-task-add-board" disabled={saving} onClick={() => addTopicTaskToBoard(task.topicId, task.id)}><Plus size={13}/> Add to To do</button>}<button type="button" className="topic-task-delete" aria-label={`Delete ${task.name}`} title={task.boardTaskId ? 'Delete this task from the skill plan and board' : 'Delete task'} disabled={saving} onClick={() => deleteTopicTask(task.topicId, task.id)}><Trash2 size={14}/></button></form>
           </article>; })}</div> : <p className="topic-task-empty">No tasks yet. Add one above and choose its topic.</p>}
         </section>
       </section>
