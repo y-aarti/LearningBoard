@@ -1,6 +1,26 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Shared skill names and topic names only. User tasks and activity remain under /users/{userId}.
+    match /skillCatalog/{skillId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.resource.data.id == skillId
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.keys().hasOnly(['id', 'name', 'createdAt', 'updatedAt']);
+      allow delete: if false;
+
+      match /topics/{topicId} {
+        allow read: if request.auth != null;
+        allow create, update: if request.auth != null
+          && request.resource.data.name is string
+          && request.resource.data.name.size() <= 80
+          && request.resource.data.keys().hasOnly(['name', 'createdAt']);
+        allow delete: if false;
+      }
+    }
+
     match /users/{userId}/tasks/{taskId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }

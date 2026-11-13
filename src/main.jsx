@@ -24,6 +24,25 @@ const projectPlanGroups = [
 const initialStored = (() => { try { return JSON.parse(localStorage.getItem('dayboard-tasks')) || []; } catch { return []; } })();
 const localDateKey = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 const cleanResourceLinks = values => values.map(value => { try { const parsed = new URL(value); return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : null; } catch { return null; } }).filter(Boolean);
+const catalogKey = value => {
+  const normalized = String(value || '').trim().toLowerCase();
+  const slug = normalized.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'skill';
+  let hash = 2166136261;
+  for (let index = 0; index < normalized.length; index += 1) hash = Math.imul(hash ^ normalized.charCodeAt(index), 16777619);
+  return `${slug}-${(hash >>> 0).toString(36)}`;
+};
+const writeSharedSkill = async (firestore, goal, topics = goal.topics || []) => {
+  const id = goal.catalogId || catalogKey(goal.name);
+  const now = new Date().toISOString();
+  const batch = writeBatch(firestore);
+  batch.set(doc(firestore, 'skillCatalog', id), { id, name: goal.name, createdAt: goal.createdAt || now, updatedAt: now }, { merge: true });
+  topics.forEach(topic => {
+    const topicId = catalogKey(topic.name);
+    batch.set(doc(firestore, 'skillCatalog', id, 'topics', topicId), { name: topic.name, createdAt: topic.createdAt || now }, { merge: true });
+  });
+  await batch.commit();
+  return id;
+};
 
 function App() {
   const today = new Date();
@@ -56,11 +75,14 @@ function App() {
   const [activeGoal, setActiveGoal] = useState(null);
   const [goalPrioritySaving, setGoalPrioritySaving] = useState(false);
   const [topicName, setTopicName] = useState('');
-  const [bulkTopicNames, setBulkTopicNames] = useState('');
   const [topicSaving, setTopicSaving] = useState(false);
   const [topicTaskName, setTopicTaskName] = useState('');
   const [topicTaskKind, setTopicTaskKind] = useState('Practice');
   const [topicTaskDate, setTopicTaskDate] = useState(localDateKey());
+  const [topicTaskDifficulty, setTopicTaskDifficulty] = useState('Beginner');
+  const [topicTaskRevisionDate, setTopicTaskRevisionDate] = useState('');
+  const [topicTaskNotes, setTopicTaskNotes] = useState('');
+  const [topicTaskLinks, setTopicTaskLinks] = useState('');
   const [studyMinutes, setStudyMinutes] = useState('25');
   const [topicTaskSaving, setTopicTaskSaving] = useState(false);
   const [activeTopicId, setActiveTopicId] = useState(null);
@@ -128,11 +150,44 @@ function App() {
         }
         try {
           const goalsSnapshot = await getDocs(collection(db, 'users', user.uid, 'goals'));
-          if (active) setPersonalGoals(goalsSnapshot.docs
-            .map(item => ({ ...item.data(), id: item.id }))
+          const localGoals = goalsSnapshot.docs.map(item => ({ ...item.data(), id: item.id }))
             .filter(goal => goal.type === 'goal-tile')
-            .map(goal => ({ ...goal, topics: Array.isArray(goal.topics) ? goal.topics : [] }))
-            .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')));
+            .map(goal => ({ ...goal, catalogId: goal.catalogId || catalogKey(goal.name), topics: Array.isArray(goal.topics) ? goal.topics : [] }));
+          let sharedGoals = [];
+          try {
+            // Publish this user's existing skill names and topic names so they become available to future accounts.
+            await Promise.all(localGoals.map(goal => writeSharedSkill(db, goal)));
+            const sharedSnapshot = await getDocs(collection(db, 'skillCatalog'));
+            const sharedEntries = await Promise.all(sharedSnapshot.docs.map(async item => {
+              const shared = { ...item.data(), id: item.id };
+              const topicSnapshot = await getDocs(collection(db, 'skillCatalog', item.id, 'topics'));
+              return { ...shared, topics: topicSnapshot.docs.map(topicDoc => ({ id: topicDoc.id, name: topicDoc.data().name, createdAt: topicDoc.data().createdAt })) };
+            }));
+            const byCatalogId = new Map(localGoals.map(goal => [goal.catalogId, goal]));
+            sharedEntries.forEach(shared => {
+              const existing = byCatalogId.get(shared.id) || localGoals.find(goal => catalogKey(goal.name) === shared.id);
+              if (!existing) {
+                const now = shared.createdAt || new Date().toISOString();
+                byCatalogId.set(shared.id, { id: `shared-${shared.id}`, catalogId: shared.id, name: shared.name, type: 'goal-tile', topics: shared.topics.map(topic => ({ ...topic, tasks: [] })), createdAt: now });
+                return;
+              }
+              const seen = new Set((existing.topics || []).map(topic => topic.name.trim().toLowerCase()));
+              const additions = shared.topics.filter(topic => !seen.has(topic.name.trim().toLowerCase())).map(topic => ({ ...topic, tasks: [] }));
+              const merged = { ...existing, catalogId: shared.id, topics: [...(existing.topics || []), ...additions] };
+              byCatalogId.set(shared.id, merged);
+            });
+            sharedGoals = [...byCatalogId.values()];
+            const changedGoals = sharedGoals.filter(goal => { const previous = localGoals.find(item => item.id === goal.id); return !previous || previous.catalogId !== goal.catalogId || previous.topics.length !== goal.topics.length; });
+            if (changedGoals.length) {
+              const batch = writeBatch(db);
+              changedGoals.forEach(goal => batch.set(doc(db, 'users', user.uid, 'goals', goal.id), goal, { merge: true }));
+              await batch.commit();
+            }
+          } catch (catalogError) {
+            if (active) setDataError(`Could not sync the shared skill catalog. Deploy the updated Firestore rules, then reload. ${catalogError.message || ''}`);
+            sharedGoals = localGoals;
+          }
+          if (active) setPersonalGoals(sharedGoals.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')));
         } catch (error) {
           if (active) setDataError(error.message || 'Could not load your goals.');
         }
@@ -186,13 +241,19 @@ function App() {
     event.preventDefault();
     const name = goalName.trim();
     if (!name || !user || !db || goalSaving) return;
-    const goal = { id: crypto.randomUUID(), name, type: 'goal-tile', topics: [], createdAt: new Date().toISOString() };
+    if (personalGoals.some(goal => goal.name.trim().toLowerCase() === name.toLowerCase())) { setDataError('That skill is already in your goals.'); return; }
+    const now = new Date().toISOString();
+    const sharedId = catalogKey(name);
+    const goal = { id: crypto.randomUUID(), catalogId: sharedId, name, type: 'goal-tile', topics: [], createdAt: now };
     setGoalSaving(true);
     pendingWrites.current += 1;
     setSaving(true);
     setDataError('');
     try {
-      await setDoc(doc(db, 'users', user.uid, 'goals', goal.id), goal);
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'users', user.uid, 'goals', goal.id), goal);
+      batch.set(doc(db, 'skillCatalog', sharedId), { id: sharedId, name, createdAt: now, updatedAt: now }, { merge: true });
+      await batch.commit();
       setPersonalGoals(current => [...current, goal]);
       setGoalName('');
       setGoalModal(false);
@@ -213,15 +274,22 @@ function App() {
       return;
     }
     const now = new Date().toISOString();
-    const updatedGoal = { ...activeGoal, topics: [...(activeGoal.topics || []), { id: crypto.randomUUID(), name, createdAt: now }], updatedAt: now };
+    const addedTopic = { id: crypto.randomUUID(), name, createdAt: now };
+    const sharedId = activeGoal.catalogId || catalogKey(activeGoal.name);
+    const updatedGoal = { ...activeGoal, catalogId: sharedId, topics: [...(activeGoal.topics || []), addedTopic], updatedAt: now };
     setTopicSaving(true);
     pendingWrites.current += 1;
     setSaving(true);
     setDataError('');
     try {
-      await setDoc(doc(db, 'users', user.uid, 'goals', activeGoal.id), updatedGoal, { merge: true });
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'users', user.uid, 'goals', activeGoal.id), updatedGoal, { merge: true });
+      batch.set(doc(db, 'skillCatalog', sharedId), { id: sharedId, name: activeGoal.name, createdAt: activeGoal.createdAt || now, updatedAt: now }, { merge: true });
+      batch.set(doc(db, 'skillCatalog', sharedId, 'topics', catalogKey(name)), { name, createdAt: now }, { merge: true });
+      await batch.commit();
       setPersonalGoals(current => current.map(goal => goal.id === updatedGoal.id ? updatedGoal : goal));
       setActiveGoal(updatedGoal);
+      setActiveTopicId(addedTopic.id);
       setTopicName('');
     } catch (error) {
       setDataError(error.message || 'Could not save this topic.');
@@ -242,29 +310,15 @@ function App() {
     } catch (error) { setDataError(error.message || 'Could not save goal priority.'); }
     finally { pendingWrites.current -= 1; setSaving(pendingWrites.current > 0); setGoalPrioritySaving(false); }
   };
-  const submitTopicBatch = async (event) => {
-    event.preventDefault();
-    if (!activeGoal || !user || !db || topicSaving) return;
-    const names = bulkTopicNames.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
-    if (names.some(name => name.length > 80)) { setDataError('Each topic must be 80 characters or fewer.'); return; }
-    const existing = new Set((activeGoal.topics || []).map(topic => topic.name.toLowerCase()));
-    const uniqueNames = [...new Set(names.filter(name => !existing.has(name.toLowerCase())))];
-    if (!uniqueNames.length) { setDataError('These topics are already in this goal.'); return; }
-    const now = new Date().toISOString();
-    const updatedGoal = { ...activeGoal, topics: [...(activeGoal.topics || []), ...uniqueNames.map(name => ({ id: crypto.randomUUID(), name, createdAt: now }))], updatedAt: now };
-    setTopicSaving(true); pendingWrites.current += 1; setSaving(true); setDataError('');
-    try {
-      await setDoc(doc(db, 'users', user.uid, 'goals', activeGoal.id), updatedGoal, { merge: true });
-      setPersonalGoals(current => current.map(goal => goal.id === updatedGoal.id ? updatedGoal : goal));
-      setActiveGoal(updatedGoal); setBulkTopicNames('');
-    } catch (error) { setDataError(error.message || 'Could not save these topics.'); }
-    finally { pendingWrites.current -= 1; setSaving(pendingWrites.current > 0); setTopicSaving(false); }
-  };
-  const saveTopicChange = async (updatedGoal) => {
+  const saveTopicChange = async (updatedGoal, updatedBoardTasks = []) => {
     if (!user || !db) return false;
     pendingWrites.current += 1; setSaving(true); setDataError('');
     try {
-      await setDoc(doc(db, 'users', user.uid, 'goals', updatedGoal.id), updatedGoal, { merge: true });
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'users', user.uid, 'goals', updatedGoal.id), updatedGoal, { merge: true });
+      updatedBoardTasks.forEach(task => batch.set(doc(db, 'users', user.uid, 'tasks', String(task.id)), task));
+      await batch.commit();
+      if (updatedBoardTasks.length) setTasks(current => current.map(task => updatedBoardTasks.find(updated => String(updated.id) === String(task.id)) || task));
       setPersonalGoals(current => current.map(goal => goal.id === updatedGoal.id ? updatedGoal : goal));
       setActiveGoal(updatedGoal);
       return true;
@@ -281,23 +335,53 @@ function App() {
     if (!topic) return;
     if ((topic.tasks || []).some(task => task.name.toLowerCase() === name.toLowerCase())) { setDataError('That task already exists in this topic.'); return; }
     setTopicTaskSaving(true);
-    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(item => item.id === activeTopicId ? { ...item, tasks: [...(item.tasks || []), { id: crypto.randomUUID(), name, kind: topicTaskKind, done: false, plannedDate: topicTaskDate || localDateKey(), createdAt: new Date().toISOString() }] } : item) };
-    if (await saveTopicChange(updatedGoal)) setTopicTaskName('');
+    const now = new Date().toISOString();
+    const newTask = { id: crypto.randomUUID(), name, kind: topicTaskKind, difficulty: topicTaskDifficulty, revisionDate: topicTaskRevisionDate || '', notes: topicTaskNotes.trim(), links: cleanResourceLinks(topicTaskLinks.split(/\r?\n/).map(value => value.trim()).filter(Boolean)), sessions: [], done: false, plannedDate: topicTaskDate || localDateKey(), createdAt: now };
+    const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(item => item.id === activeTopicId ? { ...item, tasks: [...(item.tasks || []), newTask] } : item) };
+    if (await saveTopicChange(updatedGoal)) { setTopicTaskName(''); setTopicTaskNotes(''); setTopicTaskLinks(''); setTopicTaskRevisionDate(''); }
     setTopicTaskSaving(false);
   };
-  const updateTopicField = async (topicId, field, value) => {
-    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, [field]: value } : topic) };
+  const updateTopicTaskField = async (topicId, taskId, field, value) => {
+    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, tasks: (topic.tasks || []).map(task => task.id === taskId ? { ...task, [field]: value } : task) } : topic) };
+    const boardUpdates = getLinkedBoardTaskUpdates(topicId, taskId, { [field]: value });
+    await saveTopicChange(updatedGoal, boardUpdates);
+  };
+  const updateTopicTaskFields = async (topicId, taskId, changes) => {
+    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, tasks: (topic.tasks || []).map(task => task.id === taskId ? { ...task, ...changes } : task) } : topic) };
+    await saveTopicChange(updatedGoal, getLinkedBoardTaskUpdates(topicId, taskId, changes));
+  };
+  const getLinkedBoardTaskUpdates = (topicId, taskId, changes) => {
+    const topic = activeGoal?.topics?.find(item => item.id === topicId);
+    const topicTask = topic?.tasks?.find(item => item.id === taskId);
+    if (!topicTask?.boardTaskId) return [];
+    const boardTask = tasks.find(item => String(item.id) === String(topicTask.boardTaskId));
+    if (!boardTask) return [];
+    const updated = { ...boardTask };
+    if (Object.prototype.hasOwnProperty.call(changes, 'kind')) updated.learningMode = changes.kind;
+    if (Object.prototype.hasOwnProperty.call(changes, 'difficulty')) updated.difficulty = changes.difficulty;
+    if (Object.prototype.hasOwnProperty.call(changes, 'revisionDate')) updated.revisionDate = changes.revisionDate;
+    if (Object.prototype.hasOwnProperty.call(changes, 'links')) updated.practiceLinks = changes.links;
+    if (Object.prototype.hasOwnProperty.call(changes, 'plannedDate')) {
+      const plannedDate = changes.plannedDate || localDateKey();
+      const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+      updated.plannedDate = plannedDate;
+      updated.due = plannedDate === localDateKey() ? 'Today' : plannedDate === localDateKey(tomorrow) ? 'Tomorrow' : 'This week';
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, 'notes')) updated.description = [activeGoal.name, topic.name, changes.notes].filter(Boolean).join(' · ');
+    updated.updatedAt = new Date().toISOString();
+    return [updated];
+  };
+  const moveTopicTask = async (task, nextTopicId) => {
+    if (task.boardTaskId || task.topicId === nextTopicId) return;
+    const { topicId, topicName, legacyTopic, ...taskData } = task;
+    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(topic => topic.id === task.topicId ? { ...topic, tasks: (topic.tasks || []).filter(entry => entry.id !== task.id) } : topic.id === nextTopicId ? { ...topic, tasks: [...(topic.tasks || []), taskData] } : topic) };
     await saveTopicChange(updatedGoal);
   };
-  const updateTopicFields = async (topicId, changes) => {
-    const updatedGoal = { ...activeGoal, updatedAt: new Date().toISOString(), topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, ...changes } : topic) };
-    await saveTopicChange(updatedGoal);
-  };
-  const logStudyTime = async topicId => {
+  const logStudyTime = async (topicId, taskId) => {
     const minutes = Number(studyMinutes);
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) { setDataError('Enter study time from 1 to 1,440 minutes.'); return; }
     const now = new Date().toISOString();
-    const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, sessions: [...(topic.sessions || []), { id: crypto.randomUUID(), minutes, date: localDateKey(), createdAt: now }] } : topic) };
+    const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(topic => topic.id === topicId ? { ...topic, tasks: (topic.tasks || []).map(task => task.id === taskId ? { ...task, sessions: [...(task.sessions || []), { id: crypto.randomUUID(), minutes, date: localDateKey(), createdAt: now }] } : task) } : topic) };
     if (await saveTopicChange(updatedGoal)) setStudyMinutes('25');
   };
   const deleteTopicTask = async (topicId, taskId) => {
@@ -324,7 +408,7 @@ function App() {
     const plannedDate = task.plannedDate || localDateKey();
     const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
     const due = plannedDate === localDateKey() ? 'Today' : plannedDate === localDateKey(tomorrow) ? 'Tomorrow' : 'This week';
-    const boardTask = { id: boardTaskId, title: task.name, description: `${activeGoal.name} · ${topic.name}`, category: categories.includes(activeGoal.name) ? activeGoal.name : 'Other', status: 'todo', due, priority: 'Medium', learningMode: task.kind || 'Practice', plannedDate, linkedGoalId: activeGoal.id, linkedTopicId: topic.id, linkedTopicTaskId: task.id, createdAt: now };
+    const boardTask = { id: boardTaskId, title: task.name, description: [activeGoal.name, topic.name, task.notes].filter(Boolean).join(' · '), category: categories.includes(activeGoal.name) ? activeGoal.name : 'Other', status: 'todo', due, priority: 'Medium', learningMode: task.kind || 'Practice', difficulty: task.difficulty || topic.difficulty || 'Beginner', revisionDate: task.revisionDate || topic.revisionDate || '', practiceLinks: task.links || topic.links || [], plannedDate, linkedGoalId: activeGoal.id, linkedTopicId: topic.id, linkedTopicTaskId: task.id, createdAt: now };
     const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(item => item.id === topicId ? { ...item, tasks: item.tasks.map(topicTask => topicTask.id === taskId ? { ...topicTask, boardTaskId, addedToBoard: true, done: false } : topicTask) } : item) };
     pendingWrites.current += 1; setSaving(true); setDataError('');
     try {
@@ -338,6 +422,7 @@ function App() {
     } catch (error) { setDataError(error.message || 'Could not add this task to your board.'); }
     finally { pendingWrites.current -= 1; setSaving(pendingWrites.current > 0); }
   };
+  const activeGoalTasks = (activeGoal?.topics || []).flatMap(topic => (topic.tasks || []).map(task => ({ ...task, topicId: topic.id, topicName: topic.name, legacyTopic: topic })));
   const visible = tasks;
   const createTask = (e) => { e.preventDefault(); if (!form.title.trim()) return; save([{ ...form, id: Date.now(), title: form.title.trim() }, ...tasks]); setModal(false); setForm({ title: '', description: '', category: 'React', status: 'todo', due: 'Today', priority: 'Medium' }); };
   const move = (id, status) => save(tasks.map(t => t.id === id ? { ...t, status, updatedAt: new Date().toISOString() } : t));
@@ -429,7 +514,7 @@ function App() {
       <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><b>{activePage === 'goals' ? 'Goals' : activePage === 'admin' ? 'Admin' : projects.find(project => project.id === selectedProjectId)?.name || 'My board'}</b></div><div className="top-actions"><span className="today-date"><CalendarDays size={15}/> {dateLabel}</span><button className="signout-button" onClick={handleSignOut} disabled={signOutBusy}>{signOutBusy && <span className="loading-spinner small"/>}{signOutBusy ? 'Signing out…' : 'Sign out'}</button></div></header>
       <section className="page-content">
         {!tasksReady && <div className="data-notice"><span className="loading-spinner"/>Loading your saved goals…</div>}{saving && <div className="save-indicator" role="status"><span className="loading-spinner small"/>Saving changes…</div>}{dataError && <div className="data-error" role="alert">{dataError}</div>}
-        {activePage === 'admin' ? <AdminUsersPage users={adminUsers} loading={adminUsersLoading} error={adminUsersError} onRefresh={() => setAdminRefresh(value => value + 1)} /> : activePage === 'goals' ? <GoalsPage goals={personalGoals} loading={goalsLoading} onAddGoal={() => { setGoalName(''); setGoalModal(true); }} onOpenGoal={goal => { setActiveGoal(goal); setTopicName(''); setDataError(''); }} /> : selectedProjectId && projects.some(project => project.id === selectedProjectId) ? <ProjectPage project={projects.find(project => project.id === selectedProjectId)} onBack={() => setSelectedProjectId(null)} onEdit={() => { const project = projects.find(item => item.id === selectedProjectId); setEditingProject(project); setProjectForm({ name: project.name, description: project.description || '' }); setProjectModal(true); }} onAddTechnology={addTechnology} onRemoveTechnology={removeTechnology} onSavePlan={saveProjectPlan} saving={saving}/> : <>
+        {activePage === 'admin' ? <AdminUsersPage users={adminUsers} loading={adminUsersLoading} error={adminUsersError} onRefresh={() => setAdminRefresh(value => value + 1)} /> : activePage === 'goals' ? <GoalsPage goals={personalGoals} loading={goalsLoading} onAddGoal={() => { setGoalName(''); setGoalModal(true); }} onOpenGoal={goal => { setActiveGoal(goal); setActiveTopicId(goal.topics?.[0]?.id || ''); setTopicName(''); setDataError(''); }} /> : selectedProjectId && projects.some(project => project.id === selectedProjectId) ? <ProjectPage project={projects.find(project => project.id === selectedProjectId)} onBack={() => setSelectedProjectId(null)} onEdit={() => { const project = projects.find(item => item.id === selectedProjectId); setEditingProject(project); setProjectForm({ name: project.name, description: project.description || '' }); setProjectModal(true); }} onAddTechnology={addTechnology} onRemoveTechnology={removeTechnology} onSavePlan={saveProjectPlan} saving={saving}/> : <>
         <div className="page-heading"><div><div className="eyebrow"><Sparkles size={13}/> YOUR DAILY PRACTICE</div><h1>Learning board<span className="heading-dot">.</span></h1><p className="subheading">Small steps today. Big things tomorrow.</p></div><button className="primary-button" onClick={() => setModal(true)}><Plus size={17}/> Add a goal</button></div>
         <div className="board-toolbar"><div className="board-title"><h2>Today's goals</h2><span className="board-date">{dateBadge}</span></div><button className={`done-toggle ${showDone ? 'is-on' : ''}`} type="button" aria-expanded={showDone} onClick={() => setShowDone(value => !value)}>{showDone ? <EyeOff size={15}/> : <Eye size={15}/>}<span>{showDone ? 'Hide done' : 'Show done'}</span><span className="done-toggle-count">{tasks.filter(task => task.status === 'done').length}</span></button></div>
         <div className={`board ${showDone ? 'board-with-done' : 'board-two-columns'}`}>{columns.filter(col => showDone || col.id !== 'done').map(col => { const items = visible.filter(t => t.status === col.id); return <section key={col.id} className={`column ${dragOver === col.id ? 'column-over' : ''}`} onDragOver={e => { e.preventDefault(); setDragOver(col.id); }} onDragLeave={() => setDragOver(null)} onDrop={e => { e.preventDefault(); if (dragId) move(dragId, col.id); setDragId(null); setDragOver(null); }}><div className="column-head"><div className="column-label"><span className={`status-dot ${col.tone}`}/><h3>{col.label}</h3><span className="column-count">{items.length}</span></div><button className="icon-button" aria-label={`Add goal to ${col.label}`} onClick={() => { setForm({ ...form, status: col.id }); setModal(true); }}><Plus size={17}/></button></div><div className="task-list">{items.map(task => <article key={task.id} draggable onDragStart={() => setDragId(task.id)} onDragEnd={() => { setDragId(null); setDragOver(null); }} onClick={() => setSelectedTask(task)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedTask(task); } }} tabIndex={0} role="button" aria-label={`View details for ${task.title}`} className={`task-card ${dragId === task.id ? 'dragging' : ''}`}><div className="card-top"><span className={`category-tag ${task.category.toLowerCase().replace(/[^a-z]/g, '')}`}>{task.category}</span>{task.learningMode && <span className={`learning-mode mode-${task.learningMode.toLowerCase()}`}>{task.learningMode}</span>}<button className="card-delete" aria-label={`Delete ${task.title}`} onClick={e => { e.stopPropagation(); remove(task.id); }} title="Delete goal"><Trash2 size={15}/></button></div><h4>{task.title}</h4>{task.description && <p>{task.description}</p>}<div className="card-footer"><span className={`priority priority-${task.priority.toLowerCase()}`}><span/> {task.priority}</span><span className={`due ${task.due === 'Today' ? 'due-today' : ''}`}><Clock3 size={13}/>{task.due}</span></div></article>)}{items.length === 0 && <div className="empty-state"><div className="empty-mark"><GripVertical size={19}/></div><span>{col.id === 'done' ? 'Completed goals land here' : 'Drop a goal here'}</span><small>Drag cards to update their status</small></div>}</div>{col.id === 'todo' && <button className="add-inline" onClick={() => { setForm({ ...form, status: col.id }); setModal(true); }}><Plus size={16}/> Add a goal</button>}</section>; })}</div>
@@ -439,18 +524,45 @@ function App() {
       </section>
     </main>
     {goalModal && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget && !goalSaving) setGoalModal(false); }}><form className="modal goal-modal" onSubmit={submitPersonalGoal} aria-labelledby="goal-modal-title"><div className="modal-head"><div><span className="modal-eyebrow">YOUR LEARNING GOALS</span><h2 id="goal-modal-title">Add a skill to master</h2></div><button type="button" className="icon-button close-button" aria-label="Close goal form" disabled={goalSaving} onClick={() => setGoalModal(false)}><X size={19}/></button></div><p className="goal-modal-prompt">What technology or skill do you want to excel in?</p><label className="form-label">Technology or skill <span>*</span><input autoFocus required maxLength="80" value={goalName} onChange={event => setGoalName(event.target.value)}/></label><div className="modal-actions"><button type="button" className="cancel-button" disabled={goalSaving} onClick={() => setGoalModal(false)}>Cancel</button><button type="submit" className="primary-button" disabled={goalSaving || !goalName.trim()}>{goalSaving && <span className="loading-spinner small"/>}{goalSaving ? 'Saving…' : <><Check size={16}/> Done</>}</button></div></form></div>}
-    {activeGoal && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget && !topicSaving && !topicTaskSaving) { setActiveGoal(null); setActiveTopicId(null); setDataError(''); } }}><section className="modal goal-detail-modal" aria-labelledby="goal-detail-title"><div className="modal-head"><div><span className="modal-eyebrow">SKILL PLAN</span><h2 id="goal-detail-title">{activeGoal.name}</h2></div><button type="button" className="icon-button close-button" aria-label="Close goal topics" disabled={topicSaving || topicTaskSaving} onClick={() => { setActiveGoal(null); setActiveTopicId(null); setDataError(''); }}><X size={19}/></button></div><p className="goal-detail-intro">Break this skill into topics, then add focused practice tasks to your To do board.</p><div className="goal-progress-summary">{(activeGoal.topics || []).reduce((sum, topic) => sum + (topic.tasks || []).length, 0)} tasks · {(activeGoal.topics || []).reduce((sum, topic) => sum + (topic.tasks || []).filter(task => task.done).length, 0)} completed</div><label className="goal-priority-control">Goal priority<select aria-label="Goal priority" value={activeGoal.priority || 'Normal'} disabled={goalPrioritySaving || topicSaving} onChange={event => saveGoalPriority(event.target.value)}><option>Normal</option><option>High</option></select>{goalPrioritySaving && <span className="loading-spinner small"/>}</label><h3 className="goal-topics-heading">Topics</h3>{(activeGoal.topics || []).length ? <ul className="goal-topic-list">{activeGoal.topics.map(topic => <li className={`goal-topic-row ${activeTopicId === topic.id ? 'selected' : ''}`} key={topic.id}><button type="button" className="goal-topic-open" aria-expanded={activeTopicId === topic.id} onClick={() => { setActiveTopicId(activeTopicId === topic.id ? null : topic.id); setTopicTaskName(''); setDataError(''); }}><span className="goal-topic-dot"/><span>{topic.name}</span><small>{(topic.tasks || []).filter(task => task.done).length}/{(topic.tasks || []).length} done</small></button>{activeTopicId === topic.id && <div className="topic-task-panel">
-  <div className="topic-learning-fields">
-    <label>Difficulty<select value={topic.difficulty || 'Beginner'} onChange={event => updateTopicField(topic.id, 'difficulty', event.target.value)}><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></label>
-    <label>Next revision<input type="date" value={topic.revisionDate || ''} onChange={event => updateTopicField(topic.id, 'revisionDate', event.target.value)}/></label>
-    {topic.revisionDate && topic.revisionDate <= localDateKey() && (!topic.lastReviewed || topic.lastReviewed < topic.revisionDate) && <button type="button" className="revision-reminder" onClick={() => { const next = new Date(); next.setDate(next.getDate() + 7); updateTopicFields(topic.id, { lastReviewed: localDateKey(), revisionDate: localDateKey(next) }); }}>Revision due · mark reviewed</button>}
-    <label className="topic-notes-field">Notes<textarea defaultValue={topic.notes || ''} placeholder="Capture what clicked, what is unclear, or a useful example…" rows="3" onBlur={event => { if (event.target.value !== (topic.notes || '')) updateTopicField(topic.id, 'notes', event.target.value); }}/></label>
-    <label className="topic-notes-field">Practice links<textarea defaultValue={(topic.links || []).join('\n')} placeholder="Add a documentation, tutorial, or challenge URL on each line" rows="2" onBlur={event => { const links = cleanResourceLinks(event.target.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)); if (JSON.stringify(links) !== JSON.stringify(topic.links || [])) updateTopicField(topic.id, 'links', links); }}/></label>
-    {cleanResourceLinks(topic.links || []).map(link => <a className="topic-resource-link" key={link} href={link} target="_blank" rel="noreferrer">{link}</a>)}
-    <form className="study-time-form" onSubmit={event => { event.preventDefault(); logStudyTime(topic.id); }}><span><Clock3 size={14}/> Study time · {(topic.sessions || []).reduce((sum, item) => sum + (Number(item.minutes) || 0), 0)} min total</span><input aria-label="Minutes studied" type="number" min="1" max="1440" value={studyMinutes} onChange={event => setStudyMinutes(event.target.value)}/><button type="submit" disabled={saving}>Log minutes</button></form>
-  </div>
-  <div className="topic-task-panel-head"><h4>Learning tasks</h4><span>To do board ↗</span></div>
-  {(topic.tasks || []).length ? <ul className="topic-task-list">{topic.tasks.map(task => <li key={task.id}><div className={`topic-task-toggle ${task.done ? 'completed' : ''}`} role="status" aria-label={`${task.done ? 'Completed' : 'Not completed'}: ${task.name}`}><span className="topic-task-checkbox">{task.done && <Check size={12}/>}</span><span>{task.name}</span></div><span className={`learning-mode mode-${(task.kind || 'Practice').toLowerCase()}`}>{task.kind || 'Practice'}</span>{task.boardTaskId ? <span className={`topic-task-board-status ${task.done ? 'is-done' : ''}`}>{task.done ? 'Done ✓' : 'On board'}</span> : <button type="button" className="topic-task-add-board" disabled={saving} onClick={() => addTopicTaskToBoard(topic.id, task.id)}><Plus size={13}/> Add to To do</button>}<button type="button" className="topic-task-delete" aria-label={`Delete ${task.name}`} title={task.boardTaskId ? "Remove from the board before deleting" : "Delete task"} disabled={saving || Boolean(task.boardTaskId)} onClick={() => deleteTopicTask(topic.id, task.id)}><Trash2 size={14}/></button></li>)}</ul> : <p className="topic-task-empty">No tasks yet. Add a practice task to get started.</p>}<form className="topic-task-form" onSubmit={submitTopicTask}><input aria-label="Task name" required maxLength="100" value={topicTaskName} onChange={event => setTopicTaskName(event.target.value)}/><select aria-label="Learning mode" value={topicTaskKind} onChange={event => setTopicTaskKind(event.target.value)}><option>Learn</option><option>Practice</option><option>Build</option><option>Revise</option></select><input aria-label="Plan this task for" type="date" min={localDateKey()} value={topicTaskDate} onChange={event => setTopicTaskDate(event.target.value)}/><button type="submit" className="primary-button" disabled={topicTaskSaving || saving || !topicTaskName.trim()}>{topicTaskSaving && <span className="loading-spinner small"/>}{topicTaskSaving ? 'Saving…' : <><Plus size={15}/> Add task</>}</button></form></div>}</li>)}</ul> : null}{dataError && <div className="goal-topic-error" role="alert">{dataError}</div>}<details className="goal-topic-bulk"><summary>Add several topics at once</summary><form onSubmit={submitTopicBatch}><label className="form-label">Topic names <span className="optional">One per line</span><textarea rows="5" value={bulkTopicNames} onChange={event => setBulkTopicNames(event.target.value)}/></label><button type="submit" className="secondary-button" disabled={topicSaving || !bulkTopicNames.trim()}>{topicSaving && <span className="loading-spinner small"/>}{topicSaving ? 'Saving…' : <><Plus size={15}/> Add topics</>}</button></form></details><form className="goal-topic-form" onSubmit={submitTopic}><label className="form-label">Add a topic <span>*</span><input required maxLength="80" value={topicName} onChange={event => setTopicName(event.target.value)}/></label><button type="submit" className="primary-button" disabled={topicSaving || !topicName.trim()}>{topicSaving && <span className="loading-spinner small"/>}{topicSaving ? 'Saving…' : <><Plus size={16}/> Add topic</>}</button></form></section></div>}
+    {activeGoal && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget && !topicSaving && !topicTaskSaving) { setActiveGoal(null); setActiveTopicId(null); setDataError(''); } }}>
+      <section className="modal goal-detail-modal" aria-labelledby="goal-detail-title">
+        <div className="modal-head"><div><span className="modal-eyebrow">SKILL PLAN</span><h2 id="goal-detail-title">{activeGoal.name}</h2></div><button type="button" className="icon-button close-button" aria-label="Close skill plan" disabled={topicSaving || topicTaskSaving} onClick={() => { setActiveGoal(null); setActiveTopicId(null); setDataError(''); }}><X size={19}/></button></div>
+        <p className="goal-detail-intro">Organize topics, then build a task list with a topic and learning details for each task.</p>
+        <div className="goal-progress-summary">{activeGoalTasks.length} tasks · {activeGoalTasks.filter(task => task.done).length} completed</div>
+        <label className="goal-priority-control">Goal priority<select aria-label="Goal priority" value={activeGoal.priority || 'Normal'} disabled={goalPrioritySaving || topicSaving} onChange={event => saveGoalPriority(event.target.value)}><option>Normal</option><option>High</option></select>{goalPrioritySaving && <span className="loading-spinner small"/>}</label>
+
+        <section className="skill-plan-topics" aria-labelledby="skill-plan-topics-title">
+          <div className="skill-plan-section-heading"><div><h3 id="skill-plan-topics-title">Topics</h3><p>Add topics here to make them available on each task.</p></div><span>{(activeGoal.topics || []).length}</span></div>
+          {(activeGoal.topics || []).length > 0 && <div className="skill-topic-chips">{activeGoal.topics.map(topic => <span key={topic.id}>{topic.name}</span>)}</div>}
+          <form className="goal-topic-form" onSubmit={submitTopic}><label className="form-label">New topic <span>*</span><input required maxLength="80" value={topicName} onChange={event => setTopicName(event.target.value)}/></label><button type="submit" className="primary-button" disabled={topicSaving || !topicName.trim()}>{topicSaving && <span className="loading-spinner small"/>}{topicSaving ? 'Saving…' : <><Plus size={16}/> Add topic</>}</button></form>
+        </section>
+
+        <section className="skill-plan-task-create" aria-labelledby="skill-plan-task-title">
+          <div className="skill-plan-section-heading"><div><h3 id="skill-plan-task-title">Add a task</h3><p>Choose what to learn and how you’ll practice it.</p></div></div>
+          <form className="skill-task-create-form" onSubmit={submitTopicTask}>
+            <label className="form-label skill-task-title-field"><span className="skill-field-label">Task <span>*</span></span><input required maxLength="100" value={topicTaskName} onChange={event => setTopicTaskName(event.target.value)}/></label>
+            <label className="form-label"><span className="skill-field-label">Topic <span>*</span></span><select required value={activeTopicId} onChange={event => setActiveTopicId(event.target.value)} disabled={!activeGoal.topics?.length}><option value="">{activeGoal.topics?.length ? 'Choose a topic' : 'Add a topic first'}</option>{(activeGoal.topics || []).map(topic => <option value={topic.id} key={topic.id}>{topic.name}</option>)}</select></label>
+            <label className="form-label">Learning mode<select value={topicTaskKind} onChange={event => setTopicTaskKind(event.target.value)}><option>Learn</option><option>Practice</option><option>Build</option><option>Revise</option></select></label>
+            <label className="form-label">Difficulty<select value={topicTaskDifficulty} onChange={event => setTopicTaskDifficulty(event.target.value)}><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></label>
+            <label className="form-label">Plan for<input type="date" min={localDateKey()} value={topicTaskDate} onChange={event => setTopicTaskDate(event.target.value)}/></label>
+            <label className="form-label">Revision reminder<input type="date" min={localDateKey()} value={topicTaskRevisionDate} onChange={event => setTopicTaskRevisionDate(event.target.value)}/></label>
+            <label className="form-label skill-task-wide">Notes<textarea rows="2" value={topicTaskNotes} onChange={event => setTopicTaskNotes(event.target.value)}/></label>
+            <label className="form-label skill-task-wide"><span className="skill-field-label">Practice links <span className="optional">One URL per line</span></span><textarea rows="2" value={topicTaskLinks} onChange={event => setTopicTaskLinks(event.target.value)}/></label>
+            <button type="submit" className="primary-button skill-task-submit" disabled={topicTaskSaving || saving || !topicTaskName.trim() || !activeTopicId}>{(topicTaskSaving || saving) && <span className="loading-spinner small"/>}{topicTaskSaving ? 'Saving…' : <><Plus size={15}/> Add task</>}</button>
+          </form>
+        </section>
+
+        {dataError && <div className="goal-topic-error" role="alert">{dataError}</div>}
+        <section className="skill-plan-task-list" aria-labelledby="skill-plan-tasks-title"><div className="skill-plan-section-heading"><div><h3 id="skill-plan-tasks-title">Tasks</h3><p>Tasks are grouped here; status changes stay on the board.</p></div><span>{activeGoalTasks.length}</span></div>
+          {activeGoalTasks.length ? <div className="skill-task-cards">{activeGoalTasks.map(task => { const topic = task.legacyTopic; const difficulty = task.difficulty || topic.difficulty || 'Beginner'; const revisionDate = task.revisionDate || topic.revisionDate || ''; const notes = task.notes ?? topic.notes ?? ''; const links = task.links || topic.links || []; const minutes = (task.sessions || []).reduce((sum, session) => sum + (Number(session.minutes) || 0), 0) + (!task.sessions?.length && topic.tasks?.[0]?.id === task.id ? (topic.sessions || []).reduce((sum, session) => sum + (Number(session.minutes) || 0), 0) : 0); return <article className="skill-task-card" key={task.id}>
+            <header><div><span className={`learning-mode mode-${(task.kind || 'Practice').toLowerCase()}`}>{task.kind || 'Practice'}</span><h4>{task.name}</h4><small>{task.topicName} · {difficulty}</small></div>{task.done && <span className="topic-task-board-status is-done">Done ✓</span>}</header>
+            {notes && <p className="skill-task-notes">{notes}</p>}{cleanResourceLinks(links).map(link => <a className="topic-resource-link" key={link} href={link} target="_blank" rel="noreferrer">{link}</a>)}
+            <details className="skill-task-details"><summary>Edit details · {revisionDate ? `revision ${revisionDate}` : 'no revision date'}</summary><div className="skill-task-details-grid"><label>Topic<select value={task.topicId} disabled={Boolean(task.boardTaskId)} onChange={event => moveTopicTask(task, event.target.value)}><option value={task.topicId}>{task.topicName}</option>{(activeGoal.topics || []).filter(item => item.id !== task.topicId).map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Learning mode<select value={task.kind || 'Practice'} onChange={event => updateTopicTaskField(task.topicId, task.id, 'kind', event.target.value)}><option>Learn</option><option>Practice</option><option>Build</option><option>Revise</option></select></label><label>Difficulty<select value={difficulty} onChange={event => updateTopicTaskField(task.topicId, task.id, 'difficulty', event.target.value)}><option>Beginner</option><option>Intermediate</option><option>Advanced</option></select></label><label>Revision reminder<input type="date" min={localDateKey()} value={revisionDate} onChange={event => updateTopicTaskField(task.topicId, task.id, 'revisionDate', event.target.value)}/></label><label>Plan for<input type="date" min={localDateKey()} value={task.plannedDate || localDateKey()} onChange={event => updateTopicTaskField(task.topicId, task.id, 'plannedDate', event.target.value)}/></label><label className="skill-task-wide">Notes<textarea defaultValue={notes} rows="2" onBlur={event => { if (event.target.value !== notes) updateTopicTaskField(task.topicId, task.id, 'notes', event.target.value); }}/></label><label className="skill-task-wide">Practice links<textarea defaultValue={cleanResourceLinks(links).join('\n')} rows="2" onBlur={event => { const next = cleanResourceLinks(event.target.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)); if (JSON.stringify(next) !== JSON.stringify(links)) updateTopicTaskField(task.topicId, task.id, 'links', next); }}/></label>{revisionDate && revisionDate <= localDateKey() && (!task.lastReviewed || task.lastReviewed < revisionDate) && <button type="button" className="revision-reminder" onClick={() => { const next = new Date(); next.setDate(next.getDate() + 7); updateTopicTaskFields(task.topicId, task.id, { lastReviewed: localDateKey(), revisionDate: localDateKey(next) }); }}>Revision due · mark reviewed</button>}</div></details>
+            <form className="study-time-form" onSubmit={event => { event.preventDefault(); logStudyTime(task.topicId, task.id); }}><span><Clock3 size={14}/> {minutes} min logged</span><input aria-label={`Minutes studied on ${task.name}`} type="number" min="1" max="1440" value={studyMinutes} onChange={event => setStudyMinutes(event.target.value)}/><button type="submit" disabled={saving}>Log time</button>{task.boardTaskId ? <span className={`topic-task-board-status ${task.done ? 'is-done' : ''}`}>{task.done ? 'Done ✓' : 'On board'}</span> : <button type="button" className="topic-task-add-board" disabled={saving} onClick={() => addTopicTaskToBoard(task.topicId, task.id)}><Plus size={13}/> Add to To do</button>}<button type="button" className="topic-task-delete" aria-label={`Delete ${task.name}`} title={task.boardTaskId ? 'Remove from the board before deleting' : 'Delete task'} disabled={saving || Boolean(task.boardTaskId)} onClick={() => deleteTopicTask(task.topicId, task.id)}><Trash2 size={14}/></button></form>
+          </article>; })}</div> : <p className="topic-task-empty">No tasks yet. Add one above and choose its topic.</p>}
+        </section>
+      </section>
+    </div>}
     {modal && <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setModal(false); }}><form className="modal" onSubmit={createTask}><div className="modal-head"><div><span className="modal-eyebrow">NEW LEARNING GOAL</span><h2>Add to your board</h2></div><button type="button" className="icon-button close-button" onClick={() => setModal(false)}><X size={19}/></button></div><label className="form-label">Goal title <span>*</span><input autoFocus required maxLength="100" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })}/></label><label className="form-label">Description <span className="optional">Optional</span><textarea rows="3" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })}/></label><div className="form-row"><label className="form-label">Topic<select value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>{categories.map(c => <option key={c}>{c}</option>)}</select></label><label className="form-label">Status<select value={form.status} onChange={e => setForm({ ...form, status: e.target.value })}>{columns.map(c => <option value={c.id} key={c.id}>{c.label}</option>)}</select></label></div><div className="form-row"><label className="form-label">Due<select value={form.due} onChange={e => setForm({ ...form, due: e.target.value })}><option>Today</option><option>Tomorrow</option><option>This week</option></select></label><label className="form-label">Priority<select value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}><option>Low</option><option>Medium</option><option>High</option></select></label></div><div className="modal-actions"><button type="button" className="cancel-button" onClick={() => setModal(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={16}/> Add goal</button></div></form></div>}
     {selectedTask && <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setSelectedTask(null); }}><form className="modal detail-modal" onSubmit={submitTaskEdit} aria-labelledby="detail-title"><div className="modal-head"><div><span className="modal-eyebrow">EDIT LEARNING GOAL</span><h2 id="detail-title">Update your goal</h2></div><button type="button" className="icon-button close-button" aria-label="Close editor" onClick={() => setSelectedTask(null)}><X size={19}/></button></div><label className="form-label">Goal title <span>*</span><input autoFocus required maxLength="100" value={selectedTask.title} onChange={e => updateSelectedTask('title', e.target.value)}/></label><label className="form-label">Description <span className="optional">Optional</span><textarea rows="4" value={selectedTask.description || ''} onChange={e => updateSelectedTask('description', e.target.value)}/></label><div className="form-row"><label className="form-label">Topic<select value={selectedTask.category} onChange={e => updateSelectedTask('category', e.target.value)}>{categories.map(category => <option key={category}>{category}</option>)}</select></label><label className="form-label">Status<select value={selectedTask.status} onChange={e => updateSelectedTask('status', e.target.value)}>{columns.map(column => <option value={column.id} key={column.id}>{column.label}</option>)}</select></label></div><div className="form-row"><label className="form-label">Due<select value={selectedTask.due} onChange={e => updateSelectedTask('due', e.target.value)}><option>Today</option><option>Tomorrow</option><option>This week</option></select></label><label className="form-label">Priority<select value={selectedTask.priority} onChange={e => updateSelectedTask('priority', e.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label></div><div className="modal-actions"><button type="button" className="delete-goal-button" onClick={() => { remove(selectedTask.id); setSelectedTask(null); }}>Delete goal</button><button type="button" className="cancel-button" onClick={() => setSelectedTask(null)}>Cancel</button><button type="submit" className="primary-button"><Check size={16}/> Save changes</button></div></form></div>}
     {projectModal && <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget && !creatingProject) { setProjectModal(false); setEditingProject(null); } }}><form className="modal" onSubmit={createProject} aria-labelledby="project-modal-title"><div className="modal-head"><div><span className="modal-eyebrow">PROJECTS</span><h2 id="project-modal-title">{editingProject ? 'Edit project' : 'Create a project'}</h2></div><button type="button" className="icon-button close-button" aria-label="Close project form" disabled={creatingProject} onClick={() => { setProjectModal(false); setEditingProject(null); }}><X size={19}/></button></div><label className="form-label">Project name <span>*</span><input autoFocus required maxLength="80" value={projectForm.name} onChange={e => setProjectForm({ ...projectForm, name: e.target.value })}/></label><label className="form-label">Description <span className="optional">Optional</span><textarea rows="3" maxLength="240" value={projectForm.description} onChange={e => setProjectForm({ ...projectForm, description: e.target.value })}/></label><div className="modal-actions"><button type="button" className="cancel-button" disabled={creatingProject} onClick={() => { setProjectModal(false); setEditingProject(null); }}>Cancel</button><button type="submit" className="primary-button" disabled={creatingProject}>{creatingProject && <span className="loading-spinner small"/>}{creatingProject ? 'Saving…' : <><Check size={16}/> {editingProject ? 'Save changes' : 'Create project'}</>}</button></div></form></div>}
@@ -506,7 +618,7 @@ function GoalsPage({ goals, loading, onAddGoal, onOpenGoal }) {
   const skillIcon = name => { const value = name.toLowerCase(); if (/react/.test(value)) return Atom; if (/javascript|typescript|programming|coding/.test(value)) return Braces; if (/cloud|aws|azure|firebase/.test(value)) return Cloud; if (/machine learning|\bml\b|ai|artificial intelligence/.test(value)) return Brain; if (/data|database|sql/.test(value)) return Database; if (/css|design|ui|ux/.test(value)) return Palette; if (/angular|framework|architecture/.test(value)) return Layers; if (/terminal|command line|shell/.test(value)) return Terminal; if (/reading|study|learning/.test(value)) return BookOpen; return Code2; };
   const topics = goals.flatMap(goal => (goal.topics || []).map(topic => ({ ...topic, goalName: goal.name })));
   const allTasks = topics.flatMap(topic => topic.tasks || []);
-  const sessions = topics.flatMap(topic => topic.sessions || []);
+  const sessions = topics.flatMap(topic => [...(topic.sessions || []), ...(topic.tasks || []).flatMap(task => task.sessions || [])]);
   const today = localDateKey();
   const todayPlanTasks = topics.flatMap(topic => (topic.tasks || []).filter(task => !task.done && task.plannedDate === today).map(task => ({ ...task, topicName: topic.name, goalName: topic.goalName })));
   const todayPlan = todayPlanTasks.length;
@@ -517,7 +629,7 @@ function GoalsPage({ goals, loading, onAddGoal, onOpenGoal }) {
   let streak = 0; const cursor = new Date();
   if (!activeDays.has(localDateKey(cursor))) cursor.setDate(cursor.getDate() - 1);
   while (activeDays.has(localDateKey(cursor))) { streak += 1; cursor.setDate(cursor.getDate() - 1); }
-  const dueReviews = topics.filter(topic => topic.revisionDate && topic.revisionDate <= today && (!topic.lastReviewed || topic.lastReviewed < topic.revisionDate)).length;
+  const dueReviews = topics.reduce((count, topic) => count + ((topic.tasks || []).length ? topic.tasks.filter(task => { const date = task.revisionDate || topic.revisionDate; return date && date <= today && (!task.lastReviewed || task.lastReviewed < date); }).length : (topic.revisionDate && topic.revisionDate <= today && (!topic.lastReviewed || topic.lastReviewed < topic.revisionDate) ? 1 : 0)), 0);
   return <div className="goals-page"><div className="goals-page-heading"><div><div className="eyebrow"><Target size={13}/> SKILLS YOU WANT TO MASTER</div><h1>Goals<span className="heading-dot">.</span></h1><p className="goals-page-subtitle">Choose a skill to plan topics and track your practice.</p></div><button className="primary-button" onClick={onAddGoal}><Plus size={17}/> Add a goal</button></div>{!loading && goals.length > 0 && <><section className="learning-metrics" aria-label="Learning overview"><article><small>DAILY PLAN</small><strong>{todayPlan}</strong><span>tasks scheduled for today</span></article><article><small>LEARNING STREAK</small><strong>{streak} <em>days</em></strong><span>log study time to build consistency</span></article><article><small>THIS WEEK</small><strong>{weekDone} <em>tasks</em></strong><span>{Math.floor(weekMinutes / 60)}h {weekMinutes % 60}m logged · {dueReviews} reviews due</span></article></section><section className="daily-plan"><h2>Today's learning plan</h2>{todayPlanTasks.length ? <ul>{todayPlanTasks.slice(0, 5).map(task => <li key={task.id}><span className={`learning-mode mode-${(task.kind || 'Practice').toLowerCase()}`}>{task.kind || 'Practice'}</span><span><b>{task.name}</b><small>{task.goalName} · {task.topicName}</small></span></li>)}</ul> : <p>Open a skill topic and add a task scheduled for today.</p>}{todayPlanTasks.length > 5 && <small>Plus {todayPlanTasks.length - 5} more on your plan</small>}</section><section className="weekly-review"><div><b>Weekly review</b><span>{weekDone} tasks completed · {Math.floor(weekMinutes / 60)}h {weekMinutes % 60}m learning time</span></div><span>{weekDone === 0 && weekMinutes === 0 ? 'Log a session or complete a task to start your review.' : `${allTasks.length ? Math.round(allTasks.filter(task => task.done).length / allTasks.length * 100) : 0}% of practice tasks completed overall`}</span></section></>}{loading ? <div className="goals-loading"><span className="loading-spinner"/>Loading your goals…</div> : goals.length ? <div className="goal-tile-grid">{goals.map(goal => { const topicCount = (goal.topics || []).length; const tasks = (goal.topics || []).flatMap(topic => topic.tasks || []); const done = tasks.filter(task => task.done).length; const Icon = skillIcon(goal.name); return <button type="button" className="goal-tile" key={goal.id} onClick={() => onOpenGoal(goal)} aria-label={`Open ${goal.name}: ${topicCount} topics, ${done} of ${tasks.length} tasks complete`}><span className="goal-tile-mark"><Icon size={19}/></span><h2>{goal.name}</h2>{goal.priority === 'High' && <span className="goal-priority-badge">High priority</span>}<span className="goal-tile-topic-count">{topicCount} {topicCount === 1 ? 'topic' : 'topics'} · {done}/{tasks.length} tasks done</span>{tasks.length > 0 && <span className="goal-progress-track"><span style={{ width: `${Math.round(done / tasks.length * 100)}%` }}/></span>}</button>; })}</div> : <div className="goals-empty"><div className="goals-illustration" aria-hidden="true"><svg viewBox="0 0 160 120" fill="none"><path d="M29 95c20 12 76 11 101-2" stroke="#B9DFD2" strokeWidth="5" strokeLinecap="round"/><rect x="43" y="20" width="72" height="82" rx="15" transform="rotate(7 43 20)" fill="#FFF" stroke="#CFE7DD" strokeWidth="3"/><path d="m66 42 8 8 15-17" stroke="#087E70" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round"/><path d="m61 66 35 4M59 78l25 3" stroke="#B9DFD2" strokeWidth="4" strokeLinecap="round"/><circle cx="119" cy="29" r="11" fill="#FFB946"/><path d="m31 36 3 8 8 3-8 3-3 8-3-8-8-3 8-3 3-8Z" fill="#22A58E"/><circle cx="119" cy="82" r="6" fill="#70A94F"/></svg></div><h2>Your learning starts with a skill</h2><p>Add a technology or skill, then break it into topics and focused tasks.</p><button className="primary-button" onClick={onAddGoal}><Plus size={16}/> Add your first goal</button></div>}</div>;
 }
 
