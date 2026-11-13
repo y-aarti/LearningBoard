@@ -43,6 +43,12 @@ const writeSharedSkill = async (firestore, goal, topics = goal.topics || []) => 
   await batch.commit();
   return id;
 };
+const createBoardTaskFromSkill = (goal, topic, task, now = new Date().toISOString()) => {
+  const plannedDate = task.plannedDate || localDateKey();
+  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+  const due = plannedDate === localDateKey() ? 'Today' : plannedDate === localDateKey(tomorrow) ? 'Tomorrow' : 'This week';
+  return { id: crypto.randomUUID(), title: task.name, description: [goal.name, topic.name, task.notes].filter(Boolean).join(' · '), category: categories.includes(goal.name) ? goal.name : 'Other', status: 'todo', due, priority: 'Medium', learningMode: task.kind || 'Practice', difficulty: task.difficulty || topic.difficulty || 'Beginner', revisionDate: task.revisionDate || topic.revisionDate || '', practiceLinks: task.links || topic.links || [], plannedDate, linkedGoalId: goal.id, linkedTopicId: topic.id, linkedTopicTaskId: task.id, createdAt: now };
+};
 
 function App() {
   const today = new Date();
@@ -57,6 +63,7 @@ function App() {
   const [signOutBusy, setSignOutBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const pendingWrites = useRef(0);
+  const autoPromotingTasks = useRef(false);
   const [tasksReady, setTasksReady] = useState(false);
   const [dataError, setDataError] = useState('');
   const [tasks, setTasks] = useState(initialStored);
@@ -198,6 +205,46 @@ function App() {
     loadTasks();
     return () => { active = false; };
   }, [user]);
+  useEffect(() => {
+    if (!user || !db || !tasksReady || goalsLoading || autoPromotingTasks.current) return undefined;
+    const today = localDateKey();
+    const now = new Date().toISOString();
+    const boardTasks = [];
+    const changedGoals = personalGoals.map(goal => {
+      let changed = false;
+      const topics = (goal.topics || []).map(topic => ({
+        ...topic,
+        tasks: (topic.tasks || []).map(task => {
+          if (task.done || task.boardTaskId || !task.plannedDate || task.plannedDate > today) return task;
+          const boardTask = createBoardTaskFromSkill(goal, topic, task, now);
+          boardTasks.push(boardTask);
+          changed = true;
+          return { ...task, boardTaskId: boardTask.id, addedToBoard: true };
+        }),
+      }));
+      return changed ? { ...goal, topics, updatedAt: now } : goal;
+    }).filter(goal => goal !== undefined);
+    const goalsToSave = changedGoals.filter((goal, index) => goal !== personalGoals[index]);
+    if (!boardTasks.length) return undefined;
+    autoPromotingTasks.current = true;
+    pendingWrites.current += 1;
+    setSaving(true);
+    setDataError('');
+    const batch = writeBatch(db);
+    goalsToSave.forEach(goal => batch.set(doc(db, 'users', user.uid, 'goals', goal.id), goal, { merge: true }));
+    boardTasks.forEach(task => batch.set(doc(db, 'users', user.uid, 'tasks', String(task.id)), task));
+    batch.commit().then(() => {
+      setPersonalGoals(changedGoals);
+      setTasks(current => [...boardTasks, ...current]);
+    }).catch(error => {
+      setDataError(error.message || 'Could not add today’s learning tasks to your board.');
+    }).finally(() => {
+      pendingWrites.current -= 1;
+      setSaving(pendingWrites.current > 0);
+      autoPromotingTasks.current = false;
+    });
+    return undefined;
+  }, [user, tasksReady, goalsLoading, personalGoals]);
   const save = async (next) => {
     setTasks(next);
     if (!user || !db) return;
@@ -318,7 +365,10 @@ function App() {
       batch.set(doc(db, 'users', user.uid, 'goals', updatedGoal.id), updatedGoal, { merge: true });
       updatedBoardTasks.forEach(task => batch.set(doc(db, 'users', user.uid, 'tasks', String(task.id)), task));
       await batch.commit();
-      if (updatedBoardTasks.length) setTasks(current => current.map(task => updatedBoardTasks.find(updated => String(updated.id) === String(task.id)) || task));
+      if (updatedBoardTasks.length) setTasks(current => [
+        ...updatedBoardTasks.filter(updated => !current.some(task => String(task.id) === String(updated.id))),
+        ...current.map(task => updatedBoardTasks.find(updated => String(updated.id) === String(task.id)) || task),
+      ]);
       setPersonalGoals(current => current.map(goal => goal.id === updatedGoal.id ? updatedGoal : goal));
       setActiveGoal(updatedGoal);
       return true;
@@ -336,9 +386,11 @@ function App() {
     if ((topic.tasks || []).some(task => task.name.toLowerCase() === name.toLowerCase())) { setDataError('That task already exists in this topic.'); return; }
     setTopicTaskSaving(true);
     const now = new Date().toISOString();
-    const newTask = { id: crypto.randomUUID(), name, kind: topicTaskKind, difficulty: topicTaskDifficulty, revisionDate: topicTaskRevisionDate || '', notes: topicTaskNotes.trim(), links: cleanResourceLinks(topicTaskLinks.split(/\r?\n/).map(value => value.trim()).filter(Boolean)), sessions: [], done: false, plannedDate: topicTaskDate || localDateKey(), createdAt: now };
+    let newTask = { id: crypto.randomUUID(), name, kind: topicTaskKind, difficulty: topicTaskDifficulty, revisionDate: topicTaskRevisionDate || '', notes: topicTaskNotes.trim(), links: cleanResourceLinks(topicTaskLinks.split(/\r?\n/).map(value => value.trim()).filter(Boolean)), sessions: [], done: false, plannedDate: topicTaskDate || localDateKey(), createdAt: now };
+    const boardTask = newTask.plannedDate <= localDateKey() ? createBoardTaskFromSkill(activeGoal, topic, newTask, now) : null;
+    if (boardTask) newTask = { ...newTask, boardTaskId: boardTask.id, addedToBoard: true };
     const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(item => item.id === activeTopicId ? { ...item, tasks: [...(item.tasks || []), newTask] } : item) };
-    if (await saveTopicChange(updatedGoal)) { setTopicTaskName(''); setTopicTaskNotes(''); setTopicTaskLinks(''); setTopicTaskRevisionDate(''); }
+    if (await saveTopicChange(updatedGoal, boardTask ? [boardTask] : [])) { setTopicTaskName(''); setTopicTaskNotes(''); setTopicTaskLinks(''); setTopicTaskRevisionDate(''); }
     setTopicTaskSaving(false);
   };
   const updateTopicTaskField = async (topicId, taskId, field, value) => {
@@ -403,17 +455,13 @@ function App() {
     const topic = (activeGoal?.topics || []).find(item => item.id === topicId);
     const task = (topic?.tasks || []).find(item => item.id === taskId);
     if (!topic || !task || task.boardTaskId || !user || !db || saving) return;
-    const boardTaskId = crypto.randomUUID();
     const now = new Date().toISOString();
-    const plannedDate = task.plannedDate || localDateKey();
-    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
-    const due = plannedDate === localDateKey() ? 'Today' : plannedDate === localDateKey(tomorrow) ? 'Tomorrow' : 'This week';
-    const boardTask = { id: boardTaskId, title: task.name, description: [activeGoal.name, topic.name, task.notes].filter(Boolean).join(' · '), category: categories.includes(activeGoal.name) ? activeGoal.name : 'Other', status: 'todo', due, priority: 'Medium', learningMode: task.kind || 'Practice', difficulty: task.difficulty || topic.difficulty || 'Beginner', revisionDate: task.revisionDate || topic.revisionDate || '', practiceLinks: task.links || topic.links || [], plannedDate, linkedGoalId: activeGoal.id, linkedTopicId: topic.id, linkedTopicTaskId: task.id, createdAt: now };
-    const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(item => item.id === topicId ? { ...item, tasks: item.tasks.map(topicTask => topicTask.id === taskId ? { ...topicTask, boardTaskId, addedToBoard: true, done: false } : topicTask) } : item) };
+    const boardTask = createBoardTaskFromSkill(activeGoal, topic, task, now);
+    const updatedGoal = { ...activeGoal, updatedAt: now, topics: activeGoal.topics.map(item => item.id === topicId ? { ...item, tasks: item.tasks.map(topicTask => topicTask.id === taskId ? { ...topicTask, boardTaskId: boardTask.id, addedToBoard: true, done: false } : topicTask) } : item) };
     pendingWrites.current += 1; setSaving(true); setDataError('');
     try {
       const batch = writeBatch(db);
-      batch.set(doc(db, 'users', user.uid, 'tasks', boardTaskId), boardTask);
+      batch.set(doc(db, 'users', user.uid, 'tasks', String(boardTask.id)), boardTask);
       batch.set(doc(db, 'users', user.uid, 'goals', updatedGoal.id), updatedGoal, { merge: true });
       await batch.commit();
       setTasks(current => [boardTask, ...current]);
