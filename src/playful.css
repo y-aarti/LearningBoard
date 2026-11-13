@@ -351,3 +351,20 @@ button { cursor: pointer; }
 .skill-task-create-form .skill-field-label{color:#42665c!important}
 .skill-topic-chips button{padding:7px 11px;border:1px solid transparent;border-radius:99px;background:#eaf6f0;color:#087e70;font:inherit;font-size:12px;font-weight:700;cursor:pointer;transition:background .15s,border-color .15s,transform .15s}.skill-topic-chips button:hover{transform:translateY(-1px);background:#ddf1e8}.skill-topic-chips button.selected{border-color:#087e70;background:#087e70;color:#fff;box-shadow:0 2px 6px #087e7028}.skill-task-create-form{grid-template-columns:repeat(2,minmax(0,1fr))}.skill-task-title-field{grid-column:auto}.skill-task-create-form .skill-task-description-field{grid-column:auto}.skill-task-create-form .skill-task-links-field{grid-column:auto}.skill-task-create-form .skill-task-submit{grid-column:1/-1}
 @media(max-width:760px){.skill-task-create-form{grid-template-columns:1fr}.skill-task-create-form .skill-task-submit{grid-column:1}}
+
+/* Give the board's learning goal editor room to breathe. */
+.detail-modal { width: min(76vw, 980px); min-height: min(76vh, 760px); max-height: calc(100dvh - 40px); overflow-y: auto; }
+@media (max-width: 760px) {
+  .detail-modal { width: calc(100vw - 28px); min-height: 0; max-height: calc(100dvh - 28px); padding: 22px; }
+}
+.detail-modal .goal-description-input { min-height: 190px; }
+@media (max-width: 760px) {
+  .detail-modal .goal-description-input { min-height: 150px; }
+}
+.detail-modal { height: min(90dvh, 1000px); min-height: 0; display: flex; flex-direction: column; }
+.detail-modal .goal-description-field { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.detail-modal .goal-description-input { flex: 1; min-height: 260px; }
+@media (max-width: 760px) {
+  .detail-modal { height: 90dvh; max-height: calc(100dvh - 28px); }
+  .detail-modal .goal-description-input { min-height: 190px; }
+}
